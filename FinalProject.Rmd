@@ -1,0 +1,337 @@
+---
+title: "final"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## 6 Evaluation
+
+```{r cars}
+library(readxl)
+library(SuperLearner)
+library(tidyverse)
+data <- read_xlsx("data.xlsx")
+data <- data[,-1:-2]
+data$BWG <- (as.factor(data$BWG))
+data <- cbind(data[,1:9], data[,11], data[,10])
+```
+
+
+
+
+```{r}
+I<-data[data[,"A"]==1,]
+F<-data[data[,"A"]=="0",]
+
+sum(I[,"iq"]==0)
+129/237 #0.5443038
+108/237  #0.4556962
+
+sum(F[,"iq"]==1)/358 #0.527933
+sum(F[,"iq"]==0)/358 #0.472067
+
+```
+
+
+
+### 6.1
+
+```{r 6.1}
+run.tmle.glm <- function(ObsData, trunc.level = NULL){
+  colnames(ObsData)[ncol(ObsData)] <- "Y"
+  #------------------------------------------
+  # Simple substitution estimator 
+  #------------------------------------------
+  
+  # dataframe X with baseline covariates and exposure
+  X <- subset(ObsData, select=-Y)
+  
+  # set the exposure=1 in X1 and the exposure=0 in X0
+  X1 <- X0 <- X
+  X1$A <- 1 	# intervention
+  X0$A <- 0	  # control
+  
+  # Estimate E_0(Y|A,W) with GLM
+  outcome <- glm(Y ~ ., family = "binomial", data = ObsData)
+  
+  # get the expected outcome, given the observed exposure and covariates
+  expY.givenAW <- predict(outcome, newdata=ObsData, type = "response")
+  # expected outcome, given A=1 and covariates 
+  expY.given1W <- predict(outcome, newdata=X1, type = "response")
+  # expected outcome, given A=0 and covariates
+  expY.given0W <- predict(outcome, newdata=X0, type = "response")
+  
+  # simple substitution estimator would be 
+  PsiHat.SS <- mean(expY.given1W - expY.given0W)
+  
+  #------------------------------------------
+  # Inverse probability of txt weighting
+  #------------------------------------------
+  
+  #  Super Learner for the exposure mechanism  P_0(A=1|W)
+  exposure <- glm(A ~ ., family = "binomial", data = X)
+  # generate the predicted prob of being exposed, given baseline cov
+  probA1.givenW <- predict(exposure, type = "response")
+  # generate the predicted prob of not being exposed, given baseline cov
+  probA0.givenW <- 1- probA1.givenW
+  N.probA1.givenW.trunced <- NA
+  N.probA0.givenW.trunced <- NA
+  if (!is.null(trunc.level)) {
+    N.probA1.givenW.trunced <- sum(probA1.givenW < 1/trunc.level)
+    N.probA0.givenW.trunced <- sum(probA0.givenW < 1/trunc.level)
+    probA1.givenW[probA1.givenW < 1/trunc.level] <- 1/trunc.level
+    probA0.givenW[probA0.givenW < 1/trunc.level] <- 1/trunc.level
+  }
+  # clever covariate
+  H.AW <- as.numeric(ObsData$A==1)/probA1.givenW - as.numeric(ObsData$A==0)/probA0.givenW
+  
+  # also want to evaluate the clever covariate at A=1 and A=0 for all participants
+  H.1W <- 1/probA1.givenW
+  H.0W <- -1/probA0.givenW
+  
+  # IPTW estimate
+  PsiHat.IPTW <- mean(H.AW*ObsData$Y)
+  
+  #------------------------------------------
+  # Targeting & TMLE
+  #------------------------------------------
+  
+  # Update the initial estimator of E_0(Y|A,W)
+  # run logistic regression of Y on H.AW using the logit of the esimates as offset
+  logitUpdate<- glm( ObsData$Y ~ -1 +offset(qlogis(expY.givenAW)) + 
+                       H.AW, family='binomial')
+  epsilon <- logitUpdate$coef
+  
+  # obtain the targeted estimates
+  expY.givenAW.star<- plogis( qlogis(expY.givenAW)+ epsilon*H.AW )  
+  expY.given1W.star<- plogis( qlogis(expY.given1W)+ epsilon*H.1W )	
+  expY.given0W.star<- plogis( qlogis(expY.given0W)+ epsilon*H.0W )
+  
+  # TMLE point estimate
+  PsiHat.TMLE<- mean(expY.given1W.star - expY.given0W.star)
+  
+  #------------------------------------------
+  # Return a list withthe point estimates, targeted estimates of E_0(Y|A,W), 
+  # and the vector of clever covariates
+  #------------------------------------------
+  
+  estimates <- data.frame(cbind(PsiHat.SS=PsiHat.SS, PsiHat.IPTW, PsiHat.TMLE))
+  predictions <- data.frame(cbind(expY.givenAW.star, expY.given1W.star, expY.given0W.star))
+  colnames(predictions) <- c('givenAW', 'given1W', 'given0W')
+  list(estimates=estimates, predictions=predictions, H.AW=H.AW,
+       probA1.givenW = probA1.givenW, probA0.givenW = probA0.givenW,
+       N.probA1.givenW.trunced = N.probA1.givenW.trunced, 
+       N.probA0.givenW.trunced = N.probA0.givenW.trunced)
+}
+set.seed(1)
+out.glm <- run.tmle.glm(data)
+est.glm <- out.glm$estimates
+est.glm
+# unadjusted
+mean(data$iq[data$A==1]) - mean(data$iq[data$A==0])
+```
+
+### 6.2
+
+```{r 6.2}
+run.tmle <- function(ObsData, SL.library){
+  colnames(ObsData)[11] <- "Y"
+  #------------------------------------------
+  # Simple substitution estimator 
+  #------------------------------------------
+  
+  # dataframe X with baseline covariates and exposure
+  X <- subset(ObsData, select=-Y)
+  
+  # set the exposure=1 in X1 and the exposure=0 in X0
+  X1 <- X0 <- X
+  X1$A <- 1 	# intervention
+  X0$A <- 0	  # control
+  
+  # Estimate E_0(Y|A,W) with Super Learner
+  SL.outcome <- SuperLearner(Y=ObsData$Y, X=X, SL.library=SL.library, 
+                             family="binomial")
+  
+  # get the expected outcome, given the observed exposure and covariates
+  expY.givenAW <- predict(SL.outcome, newdata=ObsData)$pred
+  # expected outcome, given A=1 and covariates 
+  expY.given1W <- predict(SL.outcome, newdata=X1)$pred
+  # expected outcome, given A=0 and covariates
+  expY.given0W <- predict(SL.outcome, newdata=X0)$pred
+  
+  # simple substitution estimator would be 
+  PsiHat.SS <- mean(expY.given1W - expY.given0W)
+  
+  #------------------------------------------
+  # Inverse probability of txt weighting
+  #------------------------------------------
+  
+  #  Super Learner for the exposure mechanism  P_0(A=1|W)
+  SL.exposure <- SuperLearner(Y=ObsData$A, 
+                              X=subset(ObsData, select= -c(A,Y)),
+                              SL.library=SL.library, family="binomial")
+  
+  # generate the predicted prob of being exposed, given baseline cov
+  probA1.givenW <- SL.exposure$SL.predict
+  # generate the predicted prob of not being exposed, given baseline cov
+  probA0.givenW <- 1- probA1.givenW
+  
+  # clever covariate
+  H.AW <- as.numeric(ObsData$A==1)/probA1.givenW - as.numeric(ObsData$A==0)/probA0.givenW
+  
+  # also want to evaluate the clever covariate at A=1 and A=0 for all participants
+  H.1W <- 1/probA1.givenW
+  H.0W <- -1/probA0.givenW
+  
+  # IPTW estimate
+  PsiHat.IPTW <- mean(H.AW*ObsData$Y)
+  
+  #------------------------------------------
+  # Targeting & TMLE
+  #------------------------------------------
+  
+  # Update the initial estimator of E_0(Y|A,W)
+  # run logistic regression of Y on H.AW using the logit of the esimates as offset
+  logitUpdate<- glm( ObsData$Y ~ -1 +offset(qlogis(expY.givenAW)) + 
+                       H.AW, family='binomial')
+  epsilon <- logitUpdate$coef
+  
+  # obtain the targeted estimates
+  expY.givenAW.star<- plogis( qlogis(expY.givenAW)+ epsilon*H.AW )  
+  expY.given1W.star<- plogis( qlogis(expY.given1W)+ epsilon*H.1W )	
+  expY.given0W.star<- plogis( qlogis(expY.given0W)+ epsilon*H.0W )
+  
+  # TMLE point estimate
+  PsiHat.TMLE<- mean(expY.given1W.star - expY.given0W.star)
+  
+  #------------------------------------------
+  # Return a list withthe point estimates, targeted estimates of E_0(Y|A,W), 
+  # and the vector of clever covariates
+  #------------------------------------------
+  
+  estimates <- data.frame(cbind(PsiHat.SS=PsiHat.SS, PsiHat.IPTW, PsiHat.TMLE))
+  predictions <- data.frame(cbind(expY.givenAW.star, expY.given1W.star, expY.given0W.star))
+  colnames(predictions) <- c('givenAW', 'given1W', 'given0W')
+  list(estimates=estimates, predictions=predictions, H.AW=H.AW)
+}
+set.seed(1)
+SL.library <- c("SL.mean", "SL.glm", "SL.glm.interaction", "SL.rpart", "SL.glmnet")
+SL.outcome <- SuperLearner(Y=data$iq, X=subset(data,select=-iq), SL.library=SL.library, 
+                           family="binomial")
+SL.outcome
+out <- run.tmle(data, SL.library)
+est <- out$estimates
+est
+
+# CV.SuperLearner ======================
+CV.SL.out<- CV.SuperLearner(Y = data$iq, X = data %>% subset(select=-iq), 
+                            SL.library = SL.library, cvControl = list(V = 5),
+                            innerCvControl = list(list(V = 10)),
+                            family = "binomial")
+summary(CV.SL.out)
+```
+
+### 6.3
+
+```{r 6.3}
+set.seed(1)
+out.glm <- run.tmle.glm(data)
+out.glm$estimates
+probA1.givenW <- out.glm$probA1.givenW
+summary(probA1.givenW)
+wt1 <- 1/probA1.givenW
+summary(wt1)
+
+out.glm.t3 <- run.tmle.glm(data, trunc.level = 3)
+out.glm.t3$estimates
+probA1.givenW.t3 <- out.glm.t3$probA1.givenW
+summary(probA1.givenW.t3)
+wt1.t3 <- 1/probA1.givenW.t3
+summary(wt1.t3)
+out.glm.t3$N.probA1.givenW.trunced
+out.glm.t3$N.probA0.givenW.trunced
+```
+
+### 6.4
+
+```{r 6.4, eval=FALSE}
+library(foreach)
+library(doParallel)
+B = 1000
+n <- nrow(data)
+registerDoParallel(cores = detectCores())
+estimates <-
+  foreach(b = 1:B, .combine = rbind) %dopar% {
+    # sample the indices 1 to n with replacement
+    bootIndices<- sample(1:n, replace=T)
+    bootData <- data[bootIndices,]
+    # calling the above function
+    output <- run.tmle(ObsData=bootData, SL.library=SL.library)$estimates
+    return(output)
+  }
+
+colnames(estimates)<-c("SimpSubs", "IPTW", "TMLE")
+summary(estimates)
+
+create.CI <- function(pt, boot, alpha=0.05){
+  Zquant <- qnorm(alpha/2, lower.tail=F)
+  CI.normal <- c(pt - Zquant*sd(boot), pt + Zquant*sd(boot) )
+  CI.quant  <- quantile(boot, prob=c(0.025,0.975) )
+  out <- data.frame(rbind(CI.normal, CI.quant))
+  colnames(out) <- c('CI.lo', 'CI.hi')
+  out
+}
+
+# Simple Subs - note the bias because of misspecified regression? Will it converge fast enough?
+est$PsiHat.SS
+create.CI(pt=est$PsiHat.SS, boot=estimates[,"SimpSubs"])
+
+# IPTW
+est$PsiHat.IPTW
+create.CI(pt=est$PsiHat.IPTW, boot=estimates[,"IPTW"])
+
+# TMLE
+est$PsiHat.TMLE
+create.CI(pt=est$PsiHat.TMLE, boot=estimates[,"TMLE"])
+
+# plot
+if(F){
+  pdf(file="project_hist_boot.pdf")
+  par(mfrow=c(3,1))
+  hist(estimates[,1], main=paste("Histogram of point estimates from the Simple Substitution estimator
+  over", B, "bootstrapped samples"), xlab="Point Estimates")
+  hist(estimates[,2], main=paste("Histogram of point estimates from IPTW estimator
+  over", B, "bootstrapped samples"), xlab="Point Estimates")
+  hist(estimates[,3], main=paste("Histogram of point estimates from TMLE
+  over", B, "bootstrapped samples"), xlab="Point Estimates")
+  dev.off()
+  
+  save(est, estimates, file = "Bootstrap_estimate.RData")
+}
+```
+
+# > est\$PsiHat.SS
+# [1] 0.009645343
+# > create.CI(pt=est\$PsiHat.SS, boot=estimates[,"SimpSubs"])
+# CI.lo      CI.hi
+# CI.normal -0.05170258 0.07099327
+# CI.quant  -0.05582542 0.07043856
+# > # IPTW
+#   > est\$PsiHat.IPTW
+# [1] 0.01404944
+# > create.CI(pt=est\$PsiHat.IPTW, boot=estimates[,"IPTW"])
+# CI.lo      CI.hi
+# CI.normal -0.05792001 0.08601889
+# CI.quant  -0.08988031 0.05151462
+# > # TMLE
+#   > est\$PsiHat.TMLE
+# [1] 0.002071535
+# > create.CI(pt=est\$PsiHat.TMLE, boot=estimates[,"TMLE"])
+# CI.lo      CI.hi
+# CI.normal -0.07523630 0.07937937
+# CI.quant  -0.07594347 0.07225387
